@@ -1,0 +1,1259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no" />
+<title>Focus Console</title>
+<meta name="description" content="A calm, tab-based productivity console for Focus, Tasks, Habits, Move, and Water — built for ADHD-friendly, low-overwhelm use." />
+
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.3.1",
+    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
+    "lucide-react": "https://esm.sh/lucide-react@0.383.0?external=react"
+  }
+}
+</script>
+
+<style>
+  html, body { background: #12181C; margin: 0; padding: 0; }
+  #root { min-height: 100vh; }
+</style>
+
+<script>
+  // Local-storage shim standing in for the Claude-artifact window.storage API,
+  // so this app works as a plain static page (e.g. on GitHub Pages).
+  window.storage = {
+    async get(key) {
+      try {
+        const v = localStorage.getItem(key);
+        return v === null ? null : { key, value: v, shared: false };
+      } catch (e) {
+        throw e;
+      }
+    },
+    async set(key, value) {
+      try {
+        localStorage.setItem(key, value);
+        return { key, value, shared: false };
+      } catch (e) {
+        throw e;
+      }
+    },
+    async delete(key) {
+      try {
+        localStorage.removeItem(key);
+        return { key, deleted: true, shared: false };
+      } catch (e) {
+        throw e;
+      }
+    },
+    async list(prefix) {
+      try {
+        const keys = Object.keys(localStorage).filter((k) => !prefix || k.startsWith(prefix));
+        return { keys };
+      } catch (e) {
+        throw e;
+      }
+    },
+  };
+</script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-type="module" data-presets="react">
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import ReactDOM from "react-dom/client";
+import {
+  Timer, ListChecks, Flame, Dumbbell, Droplets, Plus, Trash2, Check,
+  Pause, Play, RotateCcw, Settings2, X, Minus, Calendar, Clock,
+} from "lucide-react";
+
+const COLORS = {
+  bg: "#12181C",
+  panel: "#1B2429",
+  border: "#2A353B",
+  text: "#F1EDE3",
+  muted: "#8A968E",
+  coral: "#FF6F59",
+  lime: "#B4D45E",
+  amber: "#E8A33D",
+  sky: "#6FC3D0",
+};
+
+const FONT_DISPLAY = "'Sora', sans-serif";
+const FONT_BODY = "'Inter', sans-serif";
+const FONT_MONO = "'IBM Plex Mono', monospace";
+
+const DEFAULT_DATA = {
+  tasks: [],
+  habits: [],
+  workouts: [],
+  water: { target: 8, log: {} },
+  pomodoro: { focusMin: 25, breakMin: 5, longBreakMin: 15, sessionLog: {} },
+};
+
+// ---------- date helpers ----------
+const pad = (n) => String(n).padStart(2, "0");
+const dateKey = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const todayStr = () => dateKey(new Date());
+const tomorrowStr = () => {
+  const d = new Date();
+  d.setDate(d.getDate() + 1);
+  return dateKey(d);
+};
+const formatDateLabel = (dateStr) => {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const dt = new Date(y, m - 1, d);
+  return dt.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+};
+const formatTimeLabel = (timeStr) => {
+  const [h, m] = timeStr.split(":").map(Number);
+  const period = h >= 12 ? "PM" : "AM";
+  const hour12 = h % 12 === 0 ? 12 : h % 12;
+  return `${hour12}:${pad(m)} ${period}`;
+};
+const last7Days = () => {
+  const days = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    days.push(dateKey(d));
+  }
+  return days;
+};
+const weekdayLabel = (dateStr) => {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString("en-US", { weekday: "short" }).slice(0, 3);
+};
+
+function getTaskBadge(task) {
+  if (!task.scheduledDate) return null;
+  const today = todayStr();
+  const tomorrow = tomorrowStr();
+  let label, color;
+  if (task.scheduledDate < today) {
+    label = `Overdue · ${formatDateLabel(task.scheduledDate)}`;
+    color = COLORS.coral;
+  } else if (task.scheduledDate === today) {
+    label = task.scheduledTime ? `Today · ${formatTimeLabel(task.scheduledTime)}` : "Today";
+    color = COLORS.amber;
+  } else if (task.scheduledDate === tomorrow) {
+    label = "Tomorrow";
+    color = COLORS.muted;
+  } else {
+    label = formatDateLabel(task.scheduledDate);
+    color = COLORS.muted;
+  }
+  return { label, color };
+}
+
+function sortTasksByPriority(tasks) {
+  const today = todayStr();
+  const rank = (t) => {
+    if (!t.scheduledDate) return 2;
+    if (t.scheduledDate < today) return 0;
+    if (t.scheduledDate === today) return 1;
+    return 3;
+  };
+  return [...tasks].sort((a, b) => {
+    const ra = rank(a), rb = rank(b);
+    if (ra !== rb) return ra - rb;
+    if (ra === 2) return 0;
+    const da = a.scheduledDate + "T" + (a.scheduledTime || "00:00");
+    const db = b.scheduledDate + "T" + (b.scheduledTime || "00:00");
+    return da.localeCompare(db);
+  });
+}
+
+// ---------- small shared bits ----------
+function Eyebrow({ children, color }) {
+  return (
+    <div
+      style={{
+        fontFamily: FONT_MONO,
+        fontSize: 11,
+        letterSpacing: "0.14em",
+        textTransform: "uppercase",
+        color,
+        marginBottom: 4,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function SectionTitle({ eyebrow, title, color }) {
+  return (
+    <div className="mb-4">
+      <Eyebrow color={color}>{eyebrow}</Eyebrow>
+      <div style={{ fontFamily: FONT_DISPLAY, fontWeight: 600, fontSize: 22, color: COLORS.text }}>
+        {title}
+      </div>
+    </div>
+  );
+}
+
+function Panel({ children, style, className }) {
+  return (
+    <div
+      className={className}
+      style={{
+        background: COLORS.panel,
+        border: `1px solid ${COLORS.border}`,
+        borderRadius: 10,
+        ...style,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function IconButton({ icon: Icon, onClick, color, size = 36, iconSize = 16, title, filled }) {
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      style={{
+        width: size,
+        height: size,
+        borderRadius: "50%",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        background: filled ? color : "transparent",
+        border: filled ? "none" : `1px solid ${COLORS.border}`,
+        color: filled ? COLORS.bg : COLORS.text,
+        cursor: "pointer",
+        flexShrink: 0,
+      }}
+    >
+      <Icon size={iconSize} />
+    </button>
+  );
+}
+
+// ---------- confetti ----------
+function ConfettiLayer({ pieces }) {
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        pointerEvents: "none",
+        overflow: "hidden",
+        zIndex: 9999,
+      }}
+    >
+      {pieces.map((p) => (
+        <span
+          key={p.id}
+          style={{
+            position: "absolute",
+            left: `${p.left}%`,
+            top: "-40px",
+            fontSize: p.size,
+            transform: `rotate(${p.rotate}deg)`,
+            animation: `confetti-fall ${p.duration}s ease-in ${p.delay}s forwards`,
+          }}
+        >
+          {p.emoji}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+// ---------- Focus tab ----------
+function FocusTab({ data, setData, burst, topTask, toggleTask }) {
+  const [mode, setMode] = useState("focus");
+  const [secondsLeft, setSecondsLeft] = useState(data.pomodoro.focusMin * 60);
+  const [running, setRunning] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [banner, setBanner] = useState("");
+  const intervalRef = useRef(null);
+  const modeRef = useRef(mode);
+  const dataRef = useRef(data);
+
+  useEffect(() => { modeRef.current = mode; }, [mode]);
+  useEffect(() => { dataRef.current = data; }, [data]);
+
+  const modeMinutes = useCallback(
+    (m) =>
+      m === "focus" ? data.pomodoro.focusMin : m === "break" ? data.pomodoro.breakMin : data.pomodoro.longBreakMin,
+    [data.pomodoro.focusMin, data.pomodoro.breakMin, data.pomodoro.longBreakMin]
+  );
+
+  useEffect(() => {
+    if (!running) setSecondsLeft(modeMinutes(mode) * 60);
+  }, [mode, modeMinutes, running]);
+
+  const handleSessionComplete = useCallback(() => {
+    setRunning(false);
+    const currentMode = modeRef.current;
+    if (currentMode === "focus") {
+      burst(24);
+      const today = todayStr();
+      const prevCount = dataRef.current.pomodoro.sessionLog[today] || 0;
+      const newCount = prevCount + 1;
+      setData((d) => ({
+        ...d,
+        pomodoro: { ...d.pomodoro, sessionLog: { ...d.pomodoro.sessionLog, [today]: newCount } },
+      }));
+      if (newCount % 4 === 0) {
+        setBanner("Four down! Take a proper break. 🐒");
+        setMode("longBreak");
+      } else {
+        setBanner("Nice work! Short break time.");
+        setMode("break");
+      }
+    } else {
+      setBanner("Break's over, whenever you're ready.");
+      setMode("focus");
+    }
+  }, [burst, setData]);
+
+  useEffect(() => {
+    if (!running) return;
+    intervalRef.current = setInterval(() => {
+      setSecondsLeft((s) => {
+        if (s <= 1) {
+          clearInterval(intervalRef.current);
+          handleSessionComplete();
+          return 0;
+        }
+        return s - 1;
+      });
+    }, 1000);
+    return () => clearInterval(intervalRef.current);
+  }, [running, handleSessionComplete]);
+
+  const total = modeMinutes(mode) * 60;
+  const progress = total > 0 ? 1 - secondsLeft / total : 0;
+  const modeColor = mode === "focus" ? COLORS.coral : mode === "break" ? COLORS.lime : COLORS.sky;
+  const r = 100;
+  const circumference = 2 * Math.PI * r;
+  const dashOffset = circumference * (1 - progress);
+
+  const mm = pad(Math.floor(secondsLeft / 60));
+  const ss = pad(secondsLeft % 60);
+
+  const completedToday = data.pomodoro.sessionLog[todayStr()] || 0;
+  const dotsCount = Math.max(4, completedToday);
+
+  const adjustSetting = (key, delta) => {
+    setData((d) => ({
+      ...d,
+      pomodoro: { ...d.pomodoro, [key]: Math.max(5, d.pomodoro[key] + delta) },
+    }));
+  };
+
+  return (
+    <div className="flex flex-col items-center px-4 pt-6 pb-4">
+      {topTask && (
+        <Panel style={{ width: "100%", padding: 14, marginBottom: 20 }}>
+          <Eyebrow color={COLORS.coral}>Up next</Eyebrow>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => toggleTask(topTask.id)}
+              style={{
+                width: 24,
+                height: 24,
+                borderRadius: 6,
+                border: `1.5px solid ${COLORS.coral}`,
+                flexShrink: 0,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                background: "transparent",
+                cursor: "pointer",
+              }}
+            >
+              <Check size={14} color={COLORS.coral} style={{ opacity: 0 }} />
+            </button>
+            <div style={{ fontFamily: FONT_BODY, color: COLORS.text, fontSize: 15 }}>{topTask.text}</div>
+          </div>
+        </Panel>
+      )}
+
+      {banner && (
+        <div
+          style={{
+            fontFamily: FONT_BODY,
+            fontSize: 13,
+            color: COLORS.muted,
+            marginBottom: 14,
+            textAlign: "center",
+          }}
+        >
+          {banner}
+        </div>
+      )}
+
+      <div style={{ position: "relative", width: 240, height: 240 }}>
+        <svg width={240} height={240} style={{ transform: "rotate(-90deg)" }}>
+          <circle cx={120} cy={120} r={r} fill="none" stroke={COLORS.border} strokeWidth={10} />
+          <circle
+            cx={120}
+            cy={120}
+            r={r}
+            fill="none"
+            stroke={modeColor}
+            strokeWidth={10}
+            strokeLinecap="round"
+            strokeDasharray={circumference}
+            strokeDashoffset={dashOffset}
+            style={{ transition: "stroke-dashoffset 0.3s linear" }}
+          />
+        </svg>
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <div style={{ fontFamily: FONT_MONO, fontSize: 44, color: COLORS.text, fontWeight: 500 }}>
+            {mm}:{ss}
+          </div>
+          <div
+            style={{
+              fontFamily: FONT_MONO,
+              fontSize: 11,
+              letterSpacing: "0.14em",
+              textTransform: "uppercase",
+              color: modeColor,
+              marginTop: 4,
+            }}
+          >
+            {mode === "focus" ? "Focus" : mode === "break" ? "Break" : "Long break"}
+          </div>
+        </div>
+      </div>
+
+      <div className="flex items-center gap-2 mt-2">
+        {Array.from({ length: dotsCount }).map((_, i) => (
+          <div
+            key={i}
+            style={{
+              width: 8,
+              height: 8,
+              borderRadius: "50%",
+              background: i < completedToday ? COLORS.coral : "transparent",
+              border: `1px solid ${i < completedToday ? COLORS.coral : COLORS.border}`,
+            }}
+          />
+        ))}
+      </div>
+
+      <div className="flex items-center gap-5 mt-6">
+        <IconButton icon={RotateCcw} onClick={() => { setRunning(false); setSecondsLeft(modeMinutes(mode) * 60); }} />
+        <IconButton
+          icon={running ? Pause : Play}
+          onClick={() => setRunning((r) => !r)}
+          color={modeColor}
+          filled
+          size={64}
+          iconSize={26}
+        />
+        <IconButton icon={Settings2} onClick={() => setShowSettings((s) => !s)} />
+      </div>
+
+      {showSettings && (
+        <Panel style={{ width: "100%", padding: 16, marginTop: 20 }}>
+          {[
+            { key: "focusMin", label: "Focus" },
+            { key: "breakMin", label: "Break" },
+            { key: "longBreakMin", label: "Long break" },
+          ].map((row) => (
+            <div key={row.key} className="flex items-center justify-between" style={{ marginBottom: 10 }}>
+              <div style={{ fontFamily: FONT_BODY, fontSize: 14, color: COLORS.text }}>{row.label}</div>
+              <div className="flex items-center gap-3">
+                <IconButton icon={Minus} onClick={() => adjustSetting(row.key, -5)} size={28} iconSize={13} />
+                <div style={{ fontFamily: FONT_MONO, fontSize: 14, color: COLORS.text, width: 44, textAlign: "center" }}>
+                  {data.pomodoro[row.key]}m
+                </div>
+                <IconButton icon={Plus} onClick={() => adjustSetting(row.key, 5)} size={28} iconSize={13} />
+              </div>
+            </div>
+          ))}
+        </Panel>
+      )}
+    </div>
+  );
+}
+
+// ---------- Tasks tab ----------
+function TasksTab({ data, setData, burst }) {
+  const [newText, setNewText] = useState("");
+  const [showScheduler, setShowScheduler] = useState(false);
+  const [newDate, setNewDate] = useState("");
+  const [newTime, setNewTime] = useState("");
+  const [editingId, setEditingId] = useState(null);
+  const [editDate, setEditDate] = useState("");
+  const [editTime, setEditTime] = useState("");
+  const [showCompleted, setShowCompleted] = useState(false);
+
+  const addTask = () => {
+    if (!newText.trim()) return;
+    const task = {
+      id: Date.now().toString(),
+      text: newText.trim(),
+      done: false,
+      doneAt: null,
+      scheduledDate: newDate || null,
+      scheduledTime: newTime || null,
+    };
+    setData((d) => ({ ...d, tasks: [...d.tasks, task] }));
+    setNewText("");
+    setNewDate("");
+    setNewTime("");
+    setShowScheduler(false);
+  };
+
+  const toggleTask = (id) => {
+    const task = data.tasks.find((t) => t.id === id);
+    if (!task) return;
+    const nowDone = !task.done;
+    setData((d) => ({
+      ...d,
+      tasks: d.tasks.map((t) =>
+        t.id === id ? { ...t, done: nowDone, doneAt: nowDone ? new Date().toISOString() : null } : t
+      ),
+    }));
+    if (nowDone) burst(16);
+  };
+
+  const deleteTask = (id) => setData((d) => ({ ...d, tasks: d.tasks.filter((t) => t.id !== id) }));
+
+  const rescheduleTask = (id, date, time) => {
+    setData((d) => ({
+      ...d,
+      tasks: d.tasks.map((t) => (t.id === id ? { ...t, scheduledDate: date || null, scheduledTime: time || null } : t)),
+    }));
+    setEditingId(null);
+  };
+
+  const openEditor = (task) => {
+    setEditingId(task.id);
+    setEditDate(task.scheduledDate || "");
+    setEditTime(task.scheduledTime || "");
+  };
+
+  const active = data.tasks.filter((t) => !t.done);
+  const sorted = sortTasksByPriority(active);
+  const upNext = sorted[0];
+  const later = sorted.slice(1);
+  const completedToday = data.tasks.filter(
+    (t) => t.done && t.doneAt && t.doneAt.slice(0, 10) === todayStr()
+  );
+
+  const SchedulerRow = ({ date, setDate, time, setTime, onClear }) => (
+    <div className="flex items-center gap-2 flex-wrap mt-2">
+      <button
+        onClick={() => setDate(todayStr())}
+        style={{
+          fontFamily: FONT_MONO, fontSize: 11, padding: "6px 10px", borderRadius: 6,
+          border: `1px solid ${COLORS.border}`, color: COLORS.text, background: "transparent", cursor: "pointer",
+        }}
+      >
+        Today
+      </button>
+      <button
+        onClick={() => setDate(tomorrowStr())}
+        style={{
+          fontFamily: FONT_MONO, fontSize: 11, padding: "6px 10px", borderRadius: 6,
+          border: `1px solid ${COLORS.border}`, color: COLORS.text, background: "transparent", cursor: "pointer",
+        }}
+      >
+        Tomorrow
+      </button>
+      <input
+        type="date"
+        value={date}
+        onChange={(e) => setDate(e.target.value)}
+        style={{
+          fontFamily: FONT_MONO, fontSize: 12, padding: "6px 8px", borderRadius: 6,
+          border: `1px solid ${COLORS.border}`, background: COLORS.bg, color: COLORS.text,
+        }}
+      />
+      <input
+        type="time"
+        value={time}
+        onChange={(e) => setTime(e.target.value)}
+        style={{
+          fontFamily: FONT_MONO, fontSize: 12, padding: "6px 8px", borderRadius: 6,
+          border: `1px solid ${COLORS.border}`, background: COLORS.bg, color: COLORS.text,
+        }}
+      />
+      <button
+        onClick={onClear}
+        style={{
+          fontFamily: FONT_MONO, fontSize: 11, padding: "6px 10px", borderRadius: 6,
+          border: `1px solid ${COLORS.border}`, color: COLORS.muted, background: "transparent", cursor: "pointer",
+        }}
+      >
+        Clear
+      </button>
+    </div>
+  );
+
+  const TaskRow = ({ task }) => {
+    const badge = getTaskBadge(task);
+    return (
+      <div>
+        <div className="flex items-center gap-3 py-2.5">
+          <button
+            onClick={() => toggleTask(task.id)}
+            style={{
+              width: 22, height: 22, borderRadius: 6, flexShrink: 0,
+              border: `1.5px solid ${task.done ? COLORS.coral : COLORS.border}`,
+              background: task.done ? COLORS.coral : "transparent",
+              display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer",
+            }}
+          >
+            {task.done && <Check size={13} color={COLORS.bg} />}
+          </button>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div
+              style={{
+                fontFamily: FONT_BODY, fontSize: 14.5, color: task.done ? COLORS.muted : COLORS.text,
+                textDecoration: task.done ? "line-through" : "none",
+              }}
+            >
+              {task.text}
+            </div>
+            {badge && (
+              <div className="flex items-center gap-1 mt-1">
+                <Clock size={11} color={badge.color} />
+                <span style={{ fontFamily: FONT_MONO, fontSize: 11, color: badge.color }}>{badge.label}</span>
+              </div>
+            )}
+          </div>
+          {!task.done && (
+            <IconButton icon={Calendar} onClick={() => openEditor(task)} size={30} iconSize={14} />
+          )}
+          <IconButton icon={Trash2} onClick={() => deleteTask(task.id)} size={30} iconSize={14} />
+        </div>
+        {editingId === task.id && (
+          <SchedulerRow
+            date={editDate}
+            setDate={setEditDate}
+            time={editTime}
+            setTime={setEditTime}
+            onClear={() => rescheduleTask(task.id, "", "")}
+          />
+        )}
+        {editingId === task.id && (
+          <div className="flex justify-end gap-2 mt-2 mb-1">
+            <button
+              onClick={() => setEditingId(null)}
+              style={{ fontFamily: FONT_MONO, fontSize: 11, color: COLORS.muted, background: "none", border: "none", cursor: "pointer" }}
+            >
+              Cancel
+            </button>
+            <button
+              onClick={() => rescheduleTask(task.id, editDate, editTime)}
+              style={{ fontFamily: FONT_MONO, fontSize: 11, color: COLORS.coral, background: "none", border: "none", cursor: "pointer" }}
+            >
+              Save
+            </button>
+          </div>
+        )}
+        <div style={{ height: 1, background: COLORS.border, opacity: 0.6 }} />
+      </div>
+    );
+  };
+
+  return (
+    <div className="px-4 pt-6 pb-4">
+      <SectionTitle eyebrow="Tasks" title="What's on deck" color={COLORS.coral} />
+
+      <Panel style={{ padding: 12, marginBottom: 4 }}>
+        <div className="flex items-center gap-2">
+          <input
+            value={newText}
+            onChange={(e) => setNewText(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && addTask()}
+            placeholder="Add a task…"
+            style={{
+              flex: 1, fontFamily: FONT_BODY, fontSize: 14, background: "transparent",
+              border: "none", outline: "none", color: COLORS.text,
+            }}
+          />
+          <IconButton icon={Calendar} onClick={() => setShowScheduler((s) => !s)} size={32} iconSize={15} />
+          <IconButton icon={Plus} onClick={addTask} color={COLORS.coral} filled size={32} iconSize={16} />
+        </div>
+        {showScheduler && (
+          <SchedulerRow
+            date={newDate}
+            setDate={setNewDate}
+            time={newTime}
+            setTime={setNewTime}
+            onClear={() => { setNewDate(""); setNewTime(""); }}
+          />
+        )}
+      </Panel>
+
+      <div style={{ marginTop: 18 }}>
+        {upNext ? (
+          <Panel style={{ padding: 4, marginBottom: 6 }}>
+            <div style={{ padding: "8px 10px 0" }}>
+              <Eyebrow color={COLORS.coral}>Up next</Eyebrow>
+            </div>
+            <div style={{ padding: "0 10px" }}>
+              <TaskRow task={upNext} />
+            </div>
+          </Panel>
+        ) : (
+          <div style={{ fontFamily: FONT_BODY, fontSize: 13, color: COLORS.muted, padding: "12px 4px" }}>
+            Nothing on your list. Add something small to start.
+          </div>
+        )}
+      </div>
+
+      {later.length > 0 && (
+        <div style={{ marginTop: 18 }}>
+          <Eyebrow color={COLORS.muted}>Later ({later.length})</Eyebrow>
+          <Panel style={{ padding: "4px 10px" }}>
+            {later.map((t) => (
+              <TaskRow key={t.id} task={t} />
+            ))}
+          </Panel>
+        </div>
+      )}
+
+      {completedToday.length > 0 && (
+        <div style={{ marginTop: 18 }}>
+          <button
+            onClick={() => setShowCompleted((s) => !s)}
+            style={{
+              fontFamily: FONT_MONO, fontSize: 11, letterSpacing: "0.08em", color: COLORS.muted,
+              background: "none", border: "none", cursor: "pointer", padding: 0,
+            }}
+          >
+            {showCompleted ? "Hide" : "Show"} completed today ({completedToday.length})
+          </button>
+          {showCompleted && (
+            <Panel style={{ padding: "4px 10px", marginTop: 8 }}>
+              {completedToday.map((t) => (
+                <TaskRow key={t.id} task={t} />
+              ))}
+            </Panel>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- Habits tab ----------
+function HabitsTab({ data, setData, burst }) {
+  const [newName, setNewName] = useState("");
+
+  const addHabit = () => {
+    if (!newName.trim()) return;
+    setData((d) => ({
+      ...d,
+      habits: [...d.habits, { id: Date.now().toString(), name: newName.trim(), completedDates: [] }],
+    }));
+    setNewName("");
+  };
+
+  const toggleToday = (id) => {
+    const today = todayStr();
+    const habit = data.habits.find((h) => h.id === id);
+    if (!habit) return;
+    const isDone = habit.completedDates.includes(today);
+    setData((d) => ({
+      ...d,
+      habits: d.habits.map((h) =>
+        h.id === id
+          ? { ...h, completedDates: isDone ? h.completedDates.filter((x) => x !== today) : [...h.completedDates, today] }
+          : h
+      ),
+    }));
+    if (!isDone) burst(16);
+  };
+
+  const deleteHabit = (id) => setData((d) => ({ ...d, habits: d.habits.filter((h) => h.id !== id) }));
+
+  const calcStreak = (completedDates) => {
+    const set = new Set(completedDates);
+    const today = todayStr();
+    let streak = 0;
+    const cursor = new Date();
+    if (!set.has(today)) cursor.setDate(cursor.getDate() - 1);
+    while (true) {
+      const ds = dateKey(cursor);
+      if (set.has(ds)) {
+        streak++;
+        cursor.setDate(cursor.getDate() - 1);
+      } else break;
+    }
+    return streak;
+  };
+
+  const days = last7Days();
+
+  return (
+    <div className="px-4 pt-6 pb-4">
+      <SectionTitle eyebrow="Habits" title="Small, steady wins" color={COLORS.lime} />
+
+      <Panel style={{ padding: 12, marginBottom: 18 }}>
+        <div className="flex items-center gap-2">
+          <input
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && addHabit()}
+            placeholder="Add a habit…"
+            style={{ flex: 1, fontFamily: FONT_BODY, fontSize: 14, background: "transparent", border: "none", outline: "none", color: COLORS.text }}
+          />
+          <IconButton icon={Plus} onClick={addHabit} color={COLORS.lime} filled size={32} iconSize={16} />
+        </div>
+      </Panel>
+
+      {data.habits.length === 0 && (
+        <div style={{ fontFamily: FONT_BODY, fontSize: 13, color: COLORS.muted, padding: "4px 4px" }}>
+          No habits yet. Start with one you already almost do.
+        </div>
+      )}
+
+      <div className="flex flex-col gap-3">
+        {data.habits.map((h) => {
+          const doneToday = h.completedDates.includes(todayStr());
+          const streak = calcStreak(h.completedDates);
+          return (
+            <Panel key={h.id} style={{ padding: 12 }}>
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => toggleToday(h.id)}
+                  style={{
+                    width: 30, height: 30, borderRadius: "50%", flexShrink: 0,
+                    border: `2px solid ${doneToday ? COLORS.lime : COLORS.border}`,
+                    background: doneToday ? COLORS.lime : "transparent",
+                    display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer",
+                  }}
+                >
+                  {doneToday && <Check size={15} color={COLORS.bg} />}
+                </button>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontFamily: FONT_BODY, fontSize: 14.5, color: COLORS.text }}>{h.name}</div>
+                  <div style={{ fontFamily: FONT_MONO, fontSize: 11, color: COLORS.lime, marginTop: 2 }}>
+                    {streak > 0 ? `${streak} day streak` : "start today"}
+                  </div>
+                </div>
+                <IconButton icon={Trash2} onClick={() => deleteHabit(h.id)} size={30} iconSize={14} />
+              </div>
+              <div className="flex items-center gap-1.5 mt-3">
+                {days.map((d) => (
+                  <div
+                    key={d}
+                    style={{
+                      width: 10, height: 10, borderRadius: "50%",
+                      background: h.completedDates.includes(d) ? COLORS.lime : "transparent",
+                      border: `1px solid ${h.completedDates.includes(d) ? COLORS.lime : COLORS.border}`,
+                    }}
+                  />
+                ))}
+              </div>
+            </Panel>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ---------- Move tab ----------
+function MoveTab({ data, setData }) {
+  const types = ["Walk", "Run", "Strength", "Yoga", "Other"];
+  const [selectedType, setSelectedType] = useState("Walk");
+
+  const logWorkout = (minutes) => {
+    setData((d) => ({
+      ...d,
+      workouts: [...d.workouts, { id: Date.now().toString(), date: todayStr(), type: selectedType, minutes }],
+    }));
+  };
+
+  const deleteWorkout = (id) => setData((d) => ({ ...d, workouts: d.workouts.filter((w) => w.id !== id) }));
+
+  const days = last7Days();
+  const minutesByDay = days.map((d) => data.workouts.filter((w) => w.date === d).reduce((s, w) => s + w.minutes, 0));
+  const maxMinutes = Math.max(1, ...minutesByDay);
+  const weekTotal = minutesByDay.reduce((s, m) => s + m, 0);
+  const todaysWorkouts = data.workouts.filter((w) => w.date === todayStr());
+
+  return (
+    <div className="px-4 pt-6 pb-4">
+      <SectionTitle eyebrow="Move" title="Log a workout" color={COLORS.amber} />
+
+      <div className="flex gap-2 overflow-x-auto pb-2" style={{ WebkitOverflowScrolling: "touch" }}>
+        {types.map((t) => (
+          <button
+            key={t}
+            onClick={() => setSelectedType(t)}
+            style={{
+              fontFamily: FONT_MONO, fontSize: 12, padding: "8px 14px", borderRadius: 20, flexShrink: 0,
+              border: `1px solid ${selectedType === t ? COLORS.amber : COLORS.border}`,
+              background: selectedType === t ? COLORS.amber : "transparent",
+              color: selectedType === t ? COLORS.bg : COLORS.text,
+              cursor: "pointer", whiteSpace: "nowrap",
+            }}
+          >
+            {t}
+          </button>
+        ))}
+      </div>
+
+      <div className="flex gap-2 mt-4">
+        {[10, 20, 30, 45, 60].map((m) => (
+          <button
+            key={m}
+            onClick={() => logWorkout(m)}
+            style={{
+              flex: 1, fontFamily: FONT_MONO, fontSize: 13, padding: "14px 0", borderRadius: 8,
+              border: `1px solid ${COLORS.border}`, background: COLORS.panel, color: COLORS.text, cursor: "pointer",
+            }}
+          >
+            {m}m
+          </button>
+        ))}
+      </div>
+
+      <div style={{ marginTop: 22 }}>
+        <Eyebrow color={COLORS.amber}>This week</Eyebrow>
+        <div style={{ fontFamily: FONT_DISPLAY, fontWeight: 700, fontSize: 32, color: COLORS.text }}>
+          {weekTotal} <span style={{ fontSize: 15, fontFamily: FONT_MONO, color: COLORS.muted }}>min</span>
+        </div>
+        <Panel style={{ padding: 14, marginTop: 10 }}>
+          <div className="flex items-end gap-2" style={{ height: 80 }}>
+            {minutesByDay.map((m, i) => (
+              <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", height: "100%", justifyContent: "flex-end" }}>
+                <div
+                  style={{
+                    width: "70%",
+                    height: `${Math.max(3, (m / maxMinutes) * 100)}%`,
+                    background: COLORS.amber,
+                    borderRadius: 3,
+                    opacity: m === 0 ? 0.15 : 1,
+                  }}
+                />
+              </div>
+            ))}
+          </div>
+          <div className="flex gap-2 mt-2">
+            {days.map((d) => (
+              <div key={d} style={{ flex: 1, textAlign: "center", fontFamily: FONT_MONO, fontSize: 10, color: COLORS.muted }}>
+                {weekdayLabel(d)}
+              </div>
+            ))}
+          </div>
+        </Panel>
+      </div>
+
+      {todaysWorkouts.length > 0 && (
+        <div style={{ marginTop: 20 }}>
+          <Eyebrow color={COLORS.muted}>Today</Eyebrow>
+          <Panel style={{ padding: "4px 10px" }}>
+            {todaysWorkouts.map((w) => (
+              <div key={w.id} className="flex items-center gap-3 py-2.5" style={{ borderBottom: `1px solid ${COLORS.border}` }}>
+                <div style={{ flex: 1, fontFamily: FONT_BODY, fontSize: 14, color: COLORS.text }}>{w.type}</div>
+                <div style={{ fontFamily: FONT_MONO, fontSize: 12, color: COLORS.muted }}>{w.minutes}m</div>
+                <IconButton icon={Trash2} onClick={() => deleteWorkout(w.id)} size={28} iconSize={13} />
+              </div>
+            ))}
+          </Panel>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- Water tab ----------
+function WaterTab({ data, setData }) {
+  const today = todayStr();
+  const cups = data.water.log[today] || 0;
+  const target = data.water.target;
+
+  const setCups = (n) => {
+    const val = Math.max(0, n);
+    setData((d) => ({ ...d, water: { ...d.water, log: { ...d.water.log, [today]: val } } }));
+  };
+
+  const adjustTarget = (delta) => {
+    setData((d) => ({ ...d, water: { ...d.water, target: Math.max(1, d.water.target + delta) } }));
+  };
+
+  const fillPct = Math.min(1, target > 0 ? cups / target : 0) * 100;
+  const days = last7Days();
+
+  return (
+    <div className="px-4 pt-6 pb-4 flex flex-col items-center">
+      <div style={{ width: "100%" }}>
+        <SectionTitle eyebrow="Water" title="Stay topped up" color={COLORS.sky} />
+      </div>
+
+      <div
+        style={{
+          position: "relative",
+          width: 140,
+          height: 180,
+          borderRadius: "6px 6px 26px 26px",
+          border: `2px solid ${COLORS.border}`,
+          overflow: "hidden",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        <div
+          style={{
+            position: "absolute",
+            bottom: 0,
+            left: 0,
+            right: 0,
+            height: `${fillPct}%`,
+            background: COLORS.sky,
+            transition: "height 0.4s ease",
+          }}
+        />
+        <div style={{ position: "relative", fontFamily: FONT_MONO, fontSize: 20, color: COLORS.text, zIndex: 1 }}>
+          {cups}/{target}
+        </div>
+      </div>
+
+      <div className="flex items-center gap-4 mt-6">
+        <IconButton icon={Minus} onClick={() => setCups(cups - 1)} size={40} iconSize={17} />
+        <button
+          onClick={() => setCups(cups + 1)}
+          style={{
+            display: "flex", alignItems: "center", gap: 8, padding: "12px 22px", borderRadius: 24,
+            background: COLORS.sky, border: "none", color: COLORS.bg, cursor: "pointer",
+            fontFamily: FONT_BODY, fontWeight: 600, fontSize: 14,
+          }}
+        >
+          <Droplets size={16} /> +1 cup
+        </button>
+      </div>
+
+      <div className="flex items-center gap-3 mt-6">
+        <IconButton icon={Minus} onClick={() => adjustTarget(-1)} size={28} iconSize={13} />
+        <div style={{ fontFamily: FONT_MONO, fontSize: 13, color: COLORS.text }}>{target} cups target</div>
+        <IconButton icon={Plus} onClick={() => adjustTarget(1)} size={28} iconSize={13} />
+      </div>
+
+      <div style={{ width: "100%", marginTop: 24 }}>
+        <Eyebrow color={COLORS.muted}>Last 7 days</Eyebrow>
+        <Panel style={{ padding: 14 }}>
+          <div className="flex items-end gap-2" style={{ height: 70 }}>
+            {days.map((d) => {
+              const c = data.water.log[d] || 0;
+              const pct = Math.min(1, target > 0 ? c / target : 0) * 100;
+              return (
+                <div key={d} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", height: "100%", justifyContent: "flex-end" }}>
+                  <div
+                    style={{
+                      width: "70%",
+                      height: `${Math.max(3, pct)}%`,
+                      background: COLORS.sky,
+                      borderRadius: 3,
+                      opacity: c === 0 ? 0.15 : 1,
+                    }}
+                  />
+                </div>
+              );
+            })}
+          </div>
+          <div className="flex gap-2 mt-2">
+            {days.map((d) => (
+              <div key={d} style={{ flex: 1, textAlign: "center", fontFamily: FONT_MONO, fontSize: 10, color: COLORS.muted }}>
+                {weekdayLabel(d)}
+              </div>
+            ))}
+          </div>
+        </Panel>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Bottom nav ----------
+function BottomNav({ tab, setTab }) {
+  const NAV = [
+    { id: "focus", label: "Focus", icon: Timer, color: COLORS.coral },
+    { id: "tasks", label: "Tasks", icon: ListChecks, color: COLORS.coral },
+    { id: "habits", label: "Habits", icon: Flame, color: COLORS.lime },
+    { id: "move", label: "Move", icon: Dumbbell, color: COLORS.amber },
+    { id: "water", label: "Water", icon: Droplets, color: COLORS.sky },
+  ];
+  return (
+    <div
+      style={{
+        position: "fixed",
+        bottom: 0,
+        left: 0,
+        right: 0,
+        background: COLORS.panel,
+        borderTop: `1px solid ${COLORS.border}`,
+        display: "flex",
+        justifyContent: "center",
+        zIndex: 50,
+      }}
+    >
+      <div className="flex w-full" style={{ maxWidth: 768 }}>
+        {NAV.map((item) => {
+          const active = tab === item.id;
+          return (
+            <button
+              key={item.id}
+              onClick={() => setTab(item.id)}
+              style={{
+                flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 4,
+                padding: "10px 0 8px", background: "none", border: "none", cursor: "pointer",
+              }}
+            >
+              <item.icon size={20} color={active ? item.color : COLORS.muted} />
+              <span
+                style={{
+                  fontFamily: FONT_MONO, fontSize: 10, letterSpacing: "0.04em",
+                  color: active ? item.color : COLORS.muted,
+                }}
+              >
+                {item.label}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ---------- App ----------
+function FocusConsole() {
+  const [data, setData] = useState(DEFAULT_DATA);
+  const [loaded, setLoaded] = useState(false);
+  const [tab, setTab] = useState("focus");
+  const [confetti, setConfetti] = useState([]);
+  const confettiIdRef = useRef(0);
+
+  const burst = useCallback((count = 16) => {
+    const emojis = ["🐒", "🙈", "🙉", "🙊"];
+    const pieces = Array.from({ length: count }, () => {
+      confettiIdRef.current += 1;
+      return {
+        id: confettiIdRef.current,
+        emoji: emojis[Math.floor(Math.random() * emojis.length)],
+        left: Math.random() * 100,
+        size: 16 + Math.random() * 20,
+        rotate: Math.random() * 360,
+        duration: 2 + Math.random() * 0.8,
+        delay: Math.random() * 0.2,
+      };
+    });
+    setConfetti((prev) => [...prev, ...pieces]);
+    pieces.forEach((p) => {
+      setTimeout(() => {
+        setConfetti((prev) => prev.filter((x) => x.id !== p.id));
+      }, (p.duration + p.delay) * 1000 + 150);
+    });
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get("app-data", false);
+        if (res && res.value) {
+          const parsed = JSON.parse(res.value);
+          setData((prev) => ({
+            ...prev,
+            ...parsed,
+            water: { ...prev.water, ...(parsed.water || {}) },
+            pomodoro: { ...prev.pomodoro, ...(parsed.pomodoro || {}) },
+          }));
+        }
+      } catch (e) {
+        // no saved data yet
+      }
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    const t = setTimeout(async () => {
+      try {
+        await window.storage.set("app-data", JSON.stringify(data), false);
+      } catch (e) {
+        console.error("Failed to save", e);
+      }
+    }, 400);
+    return () => clearTimeout(t);
+  }, [data, loaded]);
+
+  const toggleTask = (id) => {
+    const task = data.tasks.find((t) => t.id === id);
+    if (!task) return;
+    const nowDone = !task.done;
+    setData((d) => ({
+      ...d,
+      tasks: d.tasks.map((t) =>
+        t.id === id ? { ...t, done: nowDone, doneAt: nowDone ? new Date().toISOString() : null } : t
+      ),
+    }));
+    if (nowDone) burst(16);
+  };
+
+  const topTask = sortTasksByPriority(data.tasks.filter((t) => !t.done))[0] || null;
+
+  return (
+    <div style={{ background: COLORS.bg, minHeight: "100vh", color: COLORS.text, fontFamily: FONT_BODY }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+        * { box-sizing: border-box; }
+        body { margin: 0; }
+        input[type="date"]::-webkit-calendar-picker-indicator,
+        input[type="time"]::-webkit-calendar-picker-indicator {
+          filter: invert(0.8);
+        }
+        @keyframes confetti-fall {
+          0% { top: -40px; opacity: 1; }
+          100% { top: 110vh; opacity: 0.9; }
+        }
+      `}</style>
+
+      <ConfettiLayer pieces={confetti} />
+
+      <div className="mx-auto" style={{ maxWidth: 768, paddingBottom: 90 }}>
+        {tab === "focus" && (
+          <FocusTab data={data} setData={setData} burst={burst} topTask={topTask} toggleTask={toggleTask} />
+        )}
+        {tab === "tasks" && <TasksTab data={data} setData={setData} burst={burst} />}
+        {tab === "habits" && <HabitsTab data={data} setData={setData} burst={burst} />}
+        {tab === "move" && <MoveTab data={data} setData={setData} />}
+        {tab === "water" && <WaterTab data={data} setData={setData} />}
+      </div>
+
+      <BottomNav tab={tab} setTab={setTab} />
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<FocusConsole />);
+
+</script>
+</body>
+</html>
